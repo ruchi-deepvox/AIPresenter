@@ -74,15 +74,9 @@ function App() {
     onTranscript: (text, role) => {
       if (role === 'user') {
         setUserMessage(text);
-        // If we get a genuine user transcript while auto-advancing,
-        // pause and enter Q&A mode (this catches voice interruptions
-        // that onUserSpeechStart might miss due to echo filtering)
-        if (isAutoAdvancingRef.current && text.length > 3) {
-          console.log('[App] User transcript detected — entering Q&A mode');
-          returnSlideRef.current = currentSlideRef.current;
-          isAutoAdvancingRef.current = false;
-          clearAdvanceTimeout();
-        }
+        // DO NOT pause auto-advance here. Echo from the AI's own speech
+        // gets transcribed as "user" input and would kill auto-advance.
+        // Q&A mode is entered only via Space key or onUserSpeechStart.
         setTimeout(() => setUserMessage(''), 5000);
       } else {
         setAiMessage(text);
@@ -91,12 +85,12 @@ function App() {
     },
 
     onSpeakingChange: (speaking) => {
+      console.log('[App] onSpeakingChange:', speaking, 'autoAdvancing:', isAutoAdvancingRef.current);
       if (!speaking && isAutoAdvancingRef.current) {
         // AI finished narrating a slide → schedule next slide
+        console.log('[App] Scheduling advance to next slide in 2s');
         scheduleAdvance();
       }
-      // If not auto-advancing (user Q&A mode), do NOT advance.
-      // The AI will ask "are you satisfied?" and call resume_presentation.
     },
 
     onUserSpeechStart: () => {
