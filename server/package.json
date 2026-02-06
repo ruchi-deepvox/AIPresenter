@@ -1,0 +1,16 @@
+{
+  "name": "aipresenter-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.4",
+    "express": "^4.21.0",
+    "multer": "^1.4.5-lts.1",
+    "openai": "^6.18.0"
+  }
+}
