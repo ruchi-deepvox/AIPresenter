@@ -29,8 +29,10 @@ interface UseRealtimeVoiceOptions {
   onResume?: () => void;
 }
 
-// Estimated characters-per-second for OpenAI "alloy" voice (~150 wpm)
-const CHARS_PER_SECOND = 14;
+// Estimated characters-per-second for OpenAI "alloy" voice.
+// Conservative estimate (~130 wpm with natural pauses) — better to wait a bit
+// too long than to advance while the voice is still playing.
+const CHARS_PER_SECOND = 10;
 
 export function useRealtimeVoice(options: UseRealtimeVoiceOptions = {}) {
   const [isConnected, setIsConnected] = useState(false);
@@ -93,33 +95,41 @@ export function useRealtimeVoice(options: UseRealtimeVoiceOptions = {}) {
 
   // Update session: voice, VAD, instructions, tools — all in one event
   const updateInstructions = useCallback((slides: Slide[], currentSlide: number) => {
+    // Show ALL slides with their content so the AI can identify which slide a question relates to
     const slideList = slides
       .map((s, i) => {
-        if (i === currentSlide) {
-          return `  Slide ${i + 1} [CURRENT]: "${s.title}"${s.content ? ` — ${s.content}` : ''}`;
-        }
-        return `  Slide ${i + 1}: "${s.title}"`;
+        const marker = i === currentSlide ? ' [CURRENT]' : '';
+        return `  Slide ${i + 1}${marker}: "${s.title}"${s.content ? ` — ${s.content}` : ''}`;
       })
       .join('\n');
 
     const instructions = `You are a professional AI presentation assistant. You present slides naturally, like a real human presenter.
 
-SLIDES:
+ALL SLIDES (with their content):
 ${slideList}
 
 You are currently on slide ${currentSlide + 1} of ${slides.length}.
 
 MODE — NARRATION (when you receive a [NARRATION] prompt):
-- Explain the slide content naturally and concisely.
+- Explain the current slide content naturally and concisely.
 - Do NOT ask the viewer any questions. Do NOT say "does that answer your question".
 - Just narrate the content and stop. The system will advance to the next slide automatically.
 
-MODE — Q&A (when the viewer speaks to you via microphone):
-- Answer their question clearly and concisely (1-3 sentences).
-- If the question is about a different slide, call navigate_to_slide to go there, then explain.
-- After answering, ask: "Does that answer your question? Should I continue with the presentation?"
-- If the viewer says "yes", "continue", "go on", etc. → call resume_presentation.
-- If the viewer asks a follow-up → answer it, then ask again if satisfied.`;
+MODE — Q&A (when the viewer interrupts you by speaking):
+The viewer can interrupt at any time to ask a question. Follow this exact flow:
+
+1. IDENTIFY which slide the question relates to by looking at the slide content above.
+2. If the question is about a DIFFERENT slide:
+   - Call navigate_to_slide with that slide number. The system will display that slide.
+   - Then explain the relevant content from that slide to answer their question.
+3. If the question is about the CURRENT slide:
+   - Just answer the question directly using the slide content.
+4. After answering, ask: "Does that answer your question?"
+5. If they say yes or seem satisfied, ask: "Shall I continue the presentation from where I left off?"
+6. If they say "yes", "continue", "go on", "sure", etc. → call resume_presentation. The system will navigate back to the slide you were presenting before and continue.
+7. If they have a follow-up question → answer it, then go back to step 4.
+
+IMPORTANT: You know the content of ALL slides. Use that knowledge to identify which slide the viewer is asking about, even if they don't mention a slide number.`;
 
     sendEvent({
       type: 'session.update',
@@ -151,7 +161,7 @@ MODE — Q&A (when the viewer speaks to you via microphone):
           {
             type: 'function',
             name: 'resume_presentation',
-            description: 'Resume the presentation from where it was before the user interrupted.',
+            description: 'Resume the presentation from where it was before the user interrupted. The system will automatically navigate back to the correct slide and continue narrating.',
             parameters: { type: 'object', properties: {} },
           },
         ],
@@ -266,12 +276,15 @@ MODE — Q&A (when the viewer speaks to you via microphone):
         console.log('[Realtime] Response generation complete, wasSpeaking:', wasSpeaking, 'transcript length:', transcript.length);
 
         if (wasSpeaking) {
-          // Estimate how long the audio should take to play
-          const estimatedTotalMs = (transcript.length / CHARS_PER_SECOND) * 1000;
+          // Estimate how long the audio should take to play.
+          // If transcript is empty (events missed), use a minimum 5s fallback.
+          const estimatedTotalMs = transcript.length > 0
+            ? (transcript.length / CHARS_PER_SECOND) * 1000
+            : 5000; // Fallback: assume at least 5 seconds of audio
           const elapsedMs = Date.now() - speakingStartTimeRef.current;
           const remainingMs = Math.max(0, estimatedTotalMs - elapsedMs);
 
-          console.log(`[Realtime] Audio estimate: total ~${Math.round(estimatedTotalMs / 1000)}s, elapsed ~${Math.round(elapsedMs / 1000)}s, remaining ~${Math.round(remainingMs / 1000)}s`);
+          console.log(`[Realtime] Audio estimate: total ~${Math.round(estimatedTotalMs / 1000)}s, elapsed ~${Math.round(elapsedMs / 1000)}s, remaining ~${Math.round(remainingMs / 1000)}s (transcript: ${transcript.length} chars)`);
 
           // Clear any previous timeout
           clearAudioFinishTimeout();
@@ -325,7 +338,25 @@ MODE — Q&A (when the viewer speaks to you via microphone):
       case 'response.output_audio_transcript.done': {
         const transcript = (event as any).transcript?.trim();
         if (transcript) {
-          console.log('[Realtime] AI said:', transcript);
+          console.log('[Realtime] AI said:', transcript, '(length:', transcript.length, ')');
+
+          // CRITICAL: Use the full transcript as the definitive source for
+          // audio duration estimation. Delta events may not arrive with the
+          // expected event names in WebRTC mode, so this is our safety net.
+          if (transcript.length > accumulatedTranscriptRef.current.length) {
+            accumulatedTranscriptRef.current = transcript;
+            console.log('[Realtime] Updated accumulated transcript to full text, length:', transcript.length);
+          }
+
+          // Ensure speaking state is set even if deltas didn't trigger it
+          if (!isSpeakingRef.current) {
+            isSpeakingRef.current = true;
+            speakingStartTimeRef.current = Date.now();
+            setIsSpeaking(true);
+            optionsRef.current.onSpeakingChange?.(true);
+            console.log('[Realtime] AI speaking detected via transcript.done (deltas may have been missed)');
+          }
+
           optionsRef.current.onTranscript?.(transcript, 'assistant');
         }
         break;

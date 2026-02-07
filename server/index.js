@@ -6,29 +6,41 @@ import { exec } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import http from 'http';
 import { fileURLToPath } from 'url';
-import OpenAI, { toFile } from 'openai';
+import { WebSocketServer, WebSocket } from 'ws';
+import OpenAI from 'openai';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Load API key from root .env (VITE_OPENAI_API_KEY)
+// ============================================================
+// API Keys
+// ============================================================
+
 const OPENAI_API_KEY = process.env.VITE_OPENAI_API_KEY;
-if (!OPENAI_API_KEY) {
-  console.warn('[server] WARNING: VITE_OPENAI_API_KEY not found in .env file');
-}
+const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
+
+if (!OPENAI_API_KEY) console.warn('[server] WARNING: VITE_OPENAI_API_KEY not found');
+if (!DEEPGRAM_API_KEY) console.warn('[server] WARNING: DEEPGRAM_API_KEY not found');
+if (!ELEVENLABS_API_KEY) console.warn('[server] WARNING: ELEVENLABS_API_KEY not found');
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
+// ============================================================
+// Express + HTTP server (needed for WebSocket upgrade)
+// ============================================================
+
 const app = express();
+const server = http.createServer(app);
+
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
-app.use(express.text({ type: ['application/sdp', 'text/plain'] }));
 
-// Multer stores uploaded files in a temp directory
 const upload = multer({ dest: os.tmpdir() });
 
-// Serve converted slide images as static files
+// Serve converted slide images
 const SLIDES_DIR = path.join(os.tmpdir(), 'aipresenter-slides');
 if (!fs.existsSync(SLIDES_DIR)) {
   fs.mkdirSync(SLIDES_DIR, { recursive: true });
@@ -97,83 +109,6 @@ app.delete('/api/slides/:sessionId', (req, res) => {
 });
 
 // ============================================================
-// OpenAI Whisper STT
-// ============================================================
-
-app.post('/api/whisper', upload.single('audio'), async (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ error: 'No audio file' });
-  }
-
-  const t0 = Date.now();
-  const tempPath = req.file.path;
-
-  try {
-    const buffer = fs.readFileSync(tempPath);
-    const origName = req.file.originalname || 'recording.webm';
-    console.log(`[whisper] Received: ${origName} (${(buffer.length / 1024).toFixed(1)} KB)`);
-
-    const formData = new FormData();
-    const blob = new Blob([buffer], { type: 'audio/webm' });
-    formData.append('file', blob, 'recording.webm');
-    formData.append('model', 'whisper-1');
-    formData.append('language', 'en');
-
-    const whisperResp = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}` },
-      body: formData,
-    });
-
-    const data = await whisperResp.json();
-
-    if (!whisperResp.ok) {
-      console.error('[whisper] API error:', JSON.stringify(data));
-      return res.status(whisperResp.status).json({ error: data.error?.message || 'Whisper API error' });
-    }
-
-    console.log(`[whisper] "${data.text}" (${Date.now() - t0}ms)`);
-    res.json({ text: data.text });
-  } catch (err) {
-    console.error('[whisper] Error:', err.message);
-    res.status(500).json({ error: err.message });
-  } finally {
-    try { fs.unlinkSync(tempPath); } catch {}
-  }
-});
-
-// ============================================================
-// OpenAI TTS
-// ============================================================
-
-app.post('/api/tts', async (req, res) => {
-  const { text, voice = 'alloy', speed = 1 } = req.body;
-  if (!text) {
-    return res.status(400).json({ error: 'No text provided' });
-  }
-
-  const t0 = Date.now();
-  console.log(`[tts] Request: "${text.slice(0, 60)}..." (${text.length} chars)`);
-
-  try {
-    const response = await openai.audio.speech.create({
-      model: 'tts-1',
-      voice,
-      input: text,
-      speed,
-    });
-
-    const buffer = Buffer.from(await response.arrayBuffer());
-    console.log(`[tts] Done in ${Date.now() - t0}ms (${(buffer.length / 1024).toFixed(0)} KB)`);
-    res.set('Content-Type', 'audio/mpeg');
-    res.send(buffer);
-  } catch (err) {
-    console.error('[tts] Error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ============================================================
 // OpenAI Chat Completions (GPT)
 // ============================================================
 
@@ -190,48 +125,188 @@ app.post('/api/chat', async (req, res) => {
 });
 
 // ============================================================
-// OpenAI Realtime API — WebRTC session via unified interface
+// ElevenLabs Streaming TTS Proxy
 // ============================================================
 
-app.post('/api/realtime/session', async (req, res) => {
+const ELEVENLABS_DEFAULT_VOICE = '0p0kYzKW1Gq5uoKh8Qod';
+
+app.post('/api/elevenlabs/tts', async (req, res) => {
+  const { text, voice_id } = req.body;
+  if (!text) {
+    return res.status(400).json({ error: 'No text provided' });
+  }
+  if (!ELEVENLABS_API_KEY || ELEVENLABS_API_KEY === 'YOUR_ELEVENLABS_API_KEY_HERE') {
+    return res.status(500).json({ error: 'ELEVENLABS_API_KEY not configured' });
+  }
+
+  const voiceId = voice_id || ELEVENLABS_DEFAULT_VOICE;
   const t0 = Date.now();
-  console.log('[realtime] Creating session...');
+  console.log(`[elevenlabs] TTS request: "${text.slice(0, 60)}..." (${text.length} chars, voice: ${voiceId})`);
 
   try {
-    // req.body is the raw SDP offer from the browser (text)
-    const clientSdp = req.body;
-    if (!clientSdp || typeof clientSdp !== 'string') {
-      return res.status(400).json({ error: 'Missing SDP offer' });
-    }
-
-    // Use the simple WebRTC endpoint — just send raw SDP, model in query param.
-    // gpt-4o-mini-realtime is 10x cheaper than gpt-4o-realtime ($0.03/min vs $0.30/min)
-    // All session settings (voice, VAD, tools, etc.) go via data channel session.update.
     const response = await fetch(
-      'https://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview-2024-12-17',
+      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`,
       {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${OPENAI_API_KEY}`,
-          'Content-Type': 'application/sdp',
+          'xi-api-key': ELEVENLABS_API_KEY,
+          'Content-Type': 'application/json',
+          'Accept': 'audio/mpeg',
         },
-        body: clientSdp,
+        body: JSON.stringify({
+          text,
+          model_id: 'eleven_turbo_v2_5',
+          voice_settings: {
+            stability: 0.5,
+            similarity_boost: 0.75,
+            style: 0.0,
+            use_speaker_boost: true,
+          },
+        }),
       }
     );
 
     if (!response.ok) {
       const errText = await response.text();
-      console.error('[realtime] API error:', response.status, errText);
-      return res.status(response.status).send(errText);
+      console.error('[elevenlabs] API error:', response.status, errText);
+      return res.status(response.status).json({ error: errText });
     }
 
-    const answerSdp = await response.text();
-    console.log(`[realtime] Session created in ${Date.now() - t0}ms`);
-    res.type('application/sdp').send(answerSdp);
+    // Stream audio back to the client
+    res.set({
+      'Content-Type': 'audio/mpeg',
+      'Transfer-Encoding': 'chunked',
+      'Cache-Control': 'no-cache',
+    });
+
+    const reader = response.body.getReader();
+    let totalBytes = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.length;
+      res.write(Buffer.from(value));
+    }
+
+    res.end();
+    console.log(`[elevenlabs] TTS done in ${Date.now() - t0}ms (${(totalBytes / 1024).toFixed(0)} KB)`);
   } catch (err) {
-    console.error('[realtime] Error:', err.message);
-    res.status(500).json({ error: err.message });
+    console.error('[elevenlabs] Error:', err.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message });
+    } else {
+      res.end();
+    }
   }
+});
+
+// ============================================================
+// Deepgram WebSocket Proxy
+// ============================================================
+
+const wss = new WebSocketServer({ noServer: true });
+
+// Handle HTTP upgrade for WebSocket connections
+server.on('upgrade', (request, socket, head) => {
+  const url = new URL(request.url, `http://${request.headers.host}`);
+
+  if (url.pathname === '/api/deepgram/listen') {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
+  } else {
+    socket.destroy();
+  }
+});
+
+wss.on('connection', (clientWs) => {
+  console.log('[deepgram] Browser connected via WebSocket');
+
+  if (!DEEPGRAM_API_KEY || DEEPGRAM_API_KEY === 'YOUR_DEEPGRAM_API_KEY_HERE') {
+    clientWs.send(JSON.stringify({ type: 'error', message: 'DEEPGRAM_API_KEY not configured' }));
+    clientWs.close();
+    return;
+  }
+
+  // Open WebSocket to Deepgram
+  const dgUrl = 'wss://api.deepgram.com/v1/listen?' + new URLSearchParams({
+    model: 'nova-2',
+    punctuate: 'true',
+    interim_results: 'true',
+    utterance_end_ms: '1500',
+    smart_format: 'true',
+    encoding: 'linear16',
+    sample_rate: '16000',
+    channels: '1',
+    endpointing: '300',
+    vad_events: 'true',
+  }).toString();
+
+  const dgWs = new WebSocket(dgUrl, {
+    headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` },
+  });
+
+  let dgReady = false;
+
+  dgWs.on('open', () => {
+    dgReady = true;
+    console.log('[deepgram] Connected to Deepgram');
+    clientWs.send(JSON.stringify({ type: 'connected' }));
+  });
+
+  dgWs.on('message', (data) => {
+    // Forward Deepgram transcript events to the browser
+    try {
+      const msg = JSON.parse(data.toString());
+      clientWs.send(JSON.stringify(msg));
+    } catch {
+      // Binary data — ignore
+    }
+  });
+
+  dgWs.on('error', (err) => {
+    console.error('[deepgram] WebSocket error:', err.message);
+    clientWs.send(JSON.stringify({ type: 'error', message: err.message }));
+  });
+
+  dgWs.on('close', (code, reason) => {
+    console.log(`[deepgram] Deepgram WS closed: ${code} ${reason}`);
+    if (clientWs.readyState === WebSocket.OPEN) {
+      clientWs.send(JSON.stringify({ type: 'deepgram_closed' }));
+      clientWs.close();
+    }
+  });
+
+  // Forward audio from browser to Deepgram
+  clientWs.on('message', (data, isBinary) => {
+    if (isBinary && dgReady && dgWs.readyState === WebSocket.OPEN) {
+      dgWs.send(data);
+    } else if (!isBinary) {
+      // Handle text commands from client
+      try {
+        const cmd = JSON.parse(data.toString());
+        if (cmd.type === 'close') {
+          // Gracefully close Deepgram connection
+          if (dgWs.readyState === WebSocket.OPEN) {
+            dgWs.send(JSON.stringify({ type: 'CloseStream' }));
+          }
+        }
+      } catch {}
+    }
+  });
+
+  clientWs.on('close', () => {
+    console.log('[deepgram] Browser disconnected');
+    if (dgWs.readyState === WebSocket.OPEN) {
+      dgWs.send(JSON.stringify({ type: 'CloseStream' }));
+      dgWs.close();
+    }
+  });
+
+  clientWs.on('error', (err) => {
+    console.error('[deepgram] Client WS error:', err.message);
+  });
 });
 
 // ============================================================
@@ -239,12 +314,25 @@ app.post('/api/realtime/session', async (req, res) => {
 // ============================================================
 
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', hasApiKey: !!OPENAI_API_KEY });
+  res.json({
+    status: 'ok',
+    keys: {
+      openai: !!OPENAI_API_KEY,
+      deepgram: !!(DEEPGRAM_API_KEY && DEEPGRAM_API_KEY !== 'YOUR_DEEPGRAM_API_KEY_HERE'),
+      elevenlabs: !!(ELEVENLABS_API_KEY && ELEVENLABS_API_KEY !== 'YOUR_ELEVENLABS_API_KEY_HERE'),
+    },
+  });
 });
 
+// ============================================================
+// Start (use server.listen instead of app.listen for WS support)
+// ============================================================
+
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`\n  AI Presenter Server on http://localhost:${PORT}`);
-  console.log(`  API key: ${OPENAI_API_KEY ? 'loaded' : 'MISSING'}`);
-  console.log(`  Endpoints: /api/convert, /api/whisper, /api/tts, /api/chat\n`);
+  console.log(`  OpenAI:     ${OPENAI_API_KEY ? 'loaded' : 'MISSING'}`);
+  console.log(`  Deepgram:   ${DEEPGRAM_API_KEY && DEEPGRAM_API_KEY !== 'YOUR_DEEPGRAM_API_KEY_HERE' ? 'loaded' : 'MISSING'}`);
+  console.log(`  ElevenLabs: ${ELEVENLABS_API_KEY && ELEVENLABS_API_KEY !== 'YOUR_ELEVENLABS_API_KEY_HERE' ? 'loaded' : 'MISSING'}`);
+  console.log(`  Endpoints: /api/convert, /api/chat, /api/elevenlabs/tts, /api/deepgram/listen (WS)\n`);
 });

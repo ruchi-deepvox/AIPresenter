@@ -1,9 +1,10 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { flushSync } from 'react-dom';
 import { SlideView } from './components/SlideView';
 import { SlideControls } from './components/SlideControls';
 import { AIAvatar } from './components/AIAvatar';
 import { WelcomeModal } from './components/WelcomeModal';
-import { useRealtimeVoice } from './hooks/useRealtimeVoice';
+import { usePresenterVoice } from './hooks/usePresenterVoice';
 import { Slide } from './types/slides';
 
 function App() {
@@ -24,7 +25,7 @@ function App() {
   currentSlideRef.current = currentSlide;
   slidesRef.current = slides;
 
-  // --- Helpers (defined before useRealtimeVoice so callbacks can reference them) ---
+  // --- Helpers ---
   const clearAdvanceTimeout = useCallback(() => {
     if (advanceTimeoutRef.current) {
       clearTimeout(advanceTimeoutRef.current);
@@ -45,7 +46,7 @@ function App() {
     }, 2000);
   }, [clearAdvanceTimeout]);
 
-  // --- Realtime Voice ---
+  // --- Presenter Voice (Deepgram STT + OpenAI GPT + ElevenLabs TTS) ---
   const {
     connect,
     disconnect,
@@ -54,19 +55,19 @@ function App() {
     speakText,
     interrupt,
     isConnected,
-    isSessionReady,
     isSpeaking,
     isListening,
-    error: realtimeError,
-  } = useRealtimeVoice({
+    error: voiceError,
+  } = usePresenterVoice({
     onNavigate: (action) => {
       if (action.type === 'navigate') {
         const idx = action.slideNumber - 1;
         if (idx >= 0 && idx < slidesRef.current.length) {
           console.log('[App] Navigating to slide', action.slideNumber);
           lastSpokenSlideRef.current = idx;
-          setCurrentSlide(idx);
+          updateContext(slidesRef.current, idx);
           updateInstructions(slidesRef.current, idx);
+          flushSync(() => setCurrentSlide(idx));
         }
       }
     },
@@ -74,9 +75,6 @@ function App() {
     onTranscript: (text, role) => {
       if (role === 'user') {
         setUserMessage(text);
-        // DO NOT pause auto-advance here. Echo from the AI's own speech
-        // gets transcribed as "user" input and would kill auto-advance.
-        // Q&A mode is entered only via Space key or onUserSpeechStart.
         setTimeout(() => setUserMessage(''), 5000);
       } else {
         setAiMessage(text);
@@ -104,25 +102,24 @@ function App() {
     },
 
     onResume: () => {
-      // AI called resume_presentation → go back to where we were and continue
+      // AI called resume_presentation → go back to the slide we were on and continue
       const returnTo = returnSlideRef.current;
-      console.log('[App] Resuming from slide', returnTo !== null ? returnTo + 1 : 'current');
+      console.log('[App] Resuming — returning to slide', returnTo !== null ? returnTo + 1 : 'current');
 
+      clearAdvanceTimeout();
       returnSlideRef.current = null;
       isAutoAdvancingRef.current = true;
-      lastSpokenSlideRef.current = -1; // Force re-narration
+      lastSpokenSlideRef.current = -1; // Force re-narration so AI explains the return slide
 
-      if (returnTo !== null && returnTo !== currentSlideRef.current) {
-        // Go back to the slide we were on before the interruption
-        setCurrentSlide(returnTo);
+      if (returnTo !== null) {
+        updateContext(slidesRef.current, returnTo);
         updateInstructions(slidesRef.current, returnTo);
+        flushSync(() => setCurrentSlide(returnTo));
       }
-      // If already on the right slide, the auto-narrate effect will pick it up
-      // because lastSpokenSlideRef was reset to -1
     },
   });
 
-  // --- Update Realtime context when slide changes ---
+  // --- Update context when slide changes ---
   useEffect(() => {
     if (isConnected && slides.length > 0) {
       updateContext(slides, currentSlide);
@@ -133,7 +130,7 @@ function App() {
   useEffect(() => {
     if (
       presentationStarted &&
-      isSessionReady &&
+      isConnected &&
       slides.length > 0 &&
       isAutoAdvancingRef.current &&
       currentSlide < slides.length &&
@@ -144,10 +141,8 @@ function App() {
       const isFirst = currentSlide === 0;
       const isLast = currentSlide === slides.length - 1;
 
-      // Update context for current slide
       updateInstructions(slides, currentSlide);
 
-      // Narration prompt — explicitly tells AI to just present, not ask questions
       let prompt: string;
       if (isFirst) {
         prompt = `[NARRATION] Welcome the audience and present slide 1: "${slide.title}". ${slide.content || ''} — Just narrate naturally. Do not ask the viewer any questions.`;
@@ -159,14 +154,13 @@ function App() {
 
       speakText(prompt);
     }
-  }, [presentationStarted, isSessionReady, currentSlide, slides, speakText, updateInstructions]);
+  }, [presentationStarted, isConnected, currentSlide, slides, speakText, updateInstructions]);
 
   // --- Keyboard controls ---
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (!presentationStarted || slides.length === 0) return;
 
-      // Space = interrupt AI to ask a question
       if (e.code === 'Space' && !e.repeat) {
         e.preventDefault();
         if (isSpeaking) {
@@ -204,7 +198,7 @@ function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [presentationStarted, currentSlide, slides.length, isSpeaking, interrupt, clearAdvanceTimeout]);
 
-  // --- Connect to Realtime API when presentation starts ---
+  // --- Connect when presentation starts ---
   useEffect(() => {
     if (presentationStarted && !isConnected) {
       connect();
@@ -257,9 +251,9 @@ function App() {
     <div className="relative w-screen h-screen overflow-hidden bg-slate-900">
       {showWelcome && <WelcomeModal onStart={handleStartPresentation} />}
 
-      {realtimeError && (
+      {voiceError && (
         <div className="absolute top-16 left-1/2 -translate-x-1/2 z-50 max-w-xl px-4 py-3 bg-red-50 border border-red-200 rounded-lg shadow-lg text-red-800 text-sm">
-          <strong>Error:</strong> {realtimeError}
+          <strong>Error:</strong> {voiceError}
         </div>
       )}
 
@@ -301,7 +295,6 @@ function App() {
             onNext={handleNext}
           />
 
-          {/* Hint */}
           {presentationStarted && isSpeaking && (
             <div className="absolute bottom-20 left-1/2 -translate-x-1/2 z-30 px-4 py-2 bg-black/60 rounded-full text-white/80 text-xs backdrop-blur-sm select-none">
               Press <kbd className="px-1.5 py-0.5 mx-1 bg-white/20 rounded text-white font-mono text-xs">Space</kbd> to interrupt &middot; Just speak to ask a question

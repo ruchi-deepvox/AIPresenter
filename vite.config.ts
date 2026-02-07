@@ -12,6 +12,7 @@ export default defineConfig({
       '/api': {
         target: 'http://localhost:3001',
         changeOrigin: true,
+        ws: true, // Enable WebSocket proxying for /api/deepgram/listen
       },
       '/slides': {
         target: 'http://localhost:3001',
