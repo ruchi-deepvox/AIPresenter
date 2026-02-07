@@ -2,6 +2,7 @@ import { useState, useRef, useCallback } from 'react';
 import { Sparkles, Upload, FileText, CheckCircle, AlertCircle, Loader2 } from 'lucide-react';
 import { Slide } from '../types/slides';
 import { parsePptxText } from '../utils/parsePptx';
+import { parsePdf } from '../utils/parsePdf';
 
 interface WelcomeModalProps {
   onStart: (slides: Slide[]) => void;
@@ -17,8 +18,12 @@ export const WelcomeModal = ({ onStart }: WelcomeModalProps) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFile = useCallback(async (file: File) => {
-    if (!file.name.toLowerCase().endsWith('.pptx')) {
-      setError('Please upload a .pptx file (PowerPoint format).');
+    const lower = file.name.toLowerCase();
+    const isPdf = lower.endsWith('.pdf');
+    const isPptx = lower.endsWith('.pptx');
+
+    if (!isPdf && !isPptx) {
+      setError('Please upload a .pptx (PowerPoint) or .pdf file.');
       setParsedSlides(null);
       return;
     }
@@ -29,7 +34,16 @@ export const WelcomeModal = ({ onStart }: WelcomeModalProps) => {
     setParsedSlides(null);
 
     try {
-      // Step 1: Extract text from PPTX client-side (for AI narration)
+      if (isPdf) {
+        setStatus('Processing PDF pages...');
+        const slides = await parsePdf(file);
+        if (slides.length === 0) throw new Error('No pages found in the PDF.');
+        setStatus('');
+        setParsedSlides(slides);
+        return;
+      }
+
+      // PPTX flow
       setStatus('Extracting text from slides...');
       const textSlides = await parsePptxText(file);
 
@@ -37,7 +51,6 @@ export const WelcomeModal = ({ onStart }: WelcomeModalProps) => {
         throw new Error('No slides found in the file.');
       }
 
-      // Step 2: Send PPTX to server for image conversion
       setStatus('Converting slides to images (via PowerPoint)...');
       const formData = new FormData();
       formData.append('file', file);
@@ -58,14 +71,11 @@ export const WelcomeModal = ({ onStart }: WelcomeModalProps) => {
         throw new Error('No slide images returned from server.');
       }
 
-      // Step 3: Merge text data with image URLs
       const mergedSlides: Slide[] = textSlides.map((slide, i) => ({
         ...slide,
         images: data.images[i] ? [data.images[i]] : [],
       }));
 
-      // If server returned more slides than text extraction found,
-      // add image-only slides
       for (let i = textSlides.length; i < data.images.length; i++) {
         mergedSlides.push({
           id: i + 1,
@@ -80,7 +90,7 @@ export const WelcomeModal = ({ onStart }: WelcomeModalProps) => {
       setStatus('');
       setParsedSlides(mergedSlides);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Failed to process the PPTX file.';
+      const msg = err instanceof Error ? err.message : 'Failed to process the file.';
       setError(msg);
       setStatus('');
       setParsedSlides(null);
@@ -135,7 +145,7 @@ export const WelcomeModal = ({ onStart }: WelcomeModalProps) => {
               AI Presenter
             </h1>
             <p className="text-lg text-slate-500 font-light">
-              Upload your PowerPoint and let AI present it
+              Upload your PowerPoint or PDF and let AI present it
             </p>
           </div>
 
@@ -159,7 +169,7 @@ export const WelcomeModal = ({ onStart }: WelcomeModalProps) => {
             <input
               ref={fileInputRef}
               type="file"
-              accept=".pptx"
+              accept=".pptx,.pdf"
               onChange={handleInputChange}
               className="hidden"
             />
@@ -188,7 +198,7 @@ export const WelcomeModal = ({ onStart }: WelcomeModalProps) => {
                 </div>
                 <div>
                   <p className="text-slate-700 font-medium">
-                    Drop your <span className="text-blue-600">.pptx</span> file here
+                    Drop your <span className="text-blue-600">.pptx</span> or <span className="text-blue-600">.pdf</span> file here
                   </p>
                   <p className="text-slate-400 text-sm mt-1">or click to browse</p>
                 </div>
@@ -245,7 +255,7 @@ export const WelcomeModal = ({ onStart }: WelcomeModalProps) => {
             `}
           >
             <span className="relative z-10">
-              {parsedSlides ? 'Start AI Presentation' : 'Upload a PPTX to begin'}
+              {parsedSlides ? 'Start AI Presentation' : 'Upload a PPTX or PDF to begin'}
             </span>
             {parsedSlides && (
               <div className="absolute inset-0 rounded-full bg-gradient-to-r from-blue-700 to-cyan-700 opacity-0 group-hover:opacity-100 transition-opacity" />
@@ -253,7 +263,7 @@ export const WelcomeModal = ({ onStart }: WelcomeModalProps) => {
           </button>
 
           <p className="text-xs text-slate-400">
-            Requires Microsoft PowerPoint installed for slide rendering
+            PPTX requires Microsoft PowerPoint for rendering &middot; PDF works in-browser
           </p>
         </div>
       </div>
