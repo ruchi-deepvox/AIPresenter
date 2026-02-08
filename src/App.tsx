@@ -63,11 +63,14 @@ function App() {
       if (action.type === 'navigate') {
         const idx = action.slideNumber - 1;
         if (idx >= 0 && idx < slidesRef.current.length) {
-          console.log('[App] Navigating to slide', action.slideNumber);
+          console.log('[App] ► Navigating to slide', action.slideNumber, '| returnSlide before:', returnSlideRef.current !== null ? returnSlideRef.current + 1 : 'null');
+          // IMPORTANT: Clear any pending advance timer from the previous slide
+          clearAdvanceTimeout();
           lastSpokenSlideRef.current = idx;
           updateContext(slidesRef.current, idx);
           updateInstructions(slidesRef.current, idx);
           flushSync(() => setCurrentSlide(idx));
+          console.log('[App] ► Navigation complete, currentSlide now:', idx + 1, '| returnSlide after:', returnSlideRef.current !== null ? returnSlideRef.current + 1 : 'null');
         }
       }
     },
@@ -83,10 +86,15 @@ function App() {
     },
 
     onSpeakingChange: (speaking) => {
-      console.log('[App] onSpeakingChange:', speaking, 'autoAdvancing:', isAutoAdvancingRef.current);
-      if (!speaking && isAutoAdvancingRef.current) {
-        // AI finished narrating a slide → schedule next slide
-        console.log('[App] Scheduling advance to next slide in 2s');
+      console.log('[App] onSpeakingChange:', speaking, 'autoAdvancing:', isAutoAdvancingRef.current, 'currentSlide:', currentSlideRef.current + 1, 'returnSlide:', returnSlideRef.current !== null ? returnSlideRef.current + 1 : 'null');
+      if (speaking && isAutoAdvancingRef.current) {
+        // AI started narrating a slide → save this slide as the return point
+        // This is the slide the user is actually hearing, so if they interrupt, we return here
+        returnSlideRef.current = currentSlideRef.current;
+        console.log('[App] ✓ Narration started for slide', currentSlideRef.current + 1, '— saved as returnSlide');
+      } else if (!speaking && isAutoAdvancingRef.current) {
+        // AI finished narrating → schedule advance to next slide
+        console.log('[App] ✓ Narration complete for slide', currentSlideRef.current + 1, '— scheduling advance');
         scheduleAdvance();
       }
     },
@@ -94,17 +102,23 @@ function App() {
     onUserSpeechStart: () => {
       // User started speaking → pause the presentation
       if (isAutoAdvancingRef.current) {
-        console.log('[App] User interrupted — pausing, saving return slide:', currentSlideRef.current + 1);
-        returnSlideRef.current = currentSlideRef.current;
+        // Set false FIRST so any subsequent onSpeakingChange(false) won't overwrite returnSlideRef
         isAutoAdvancingRef.current = false;
         clearAdvanceTimeout();
+
+        // returnSlideRef was already set in onSpeakingChange(false) when last narration completed
+        // Only set it if null (e.g., first slide mid-narration)
+        if (returnSlideRef.current === null) {
+          returnSlideRef.current = currentSlideRef.current;
+        }
+        console.log('[App] User speech — pausing, returnSlide:', returnSlideRef.current !== null ? returnSlideRef.current + 1 : 'null');
       }
     },
 
     onResume: () => {
       // AI called resume_presentation → go back to the slide we were on and continue
       const returnTo = returnSlideRef.current;
-      console.log('[App] Resuming — returning to slide', returnTo !== null ? returnTo + 1 : 'current');
+      console.log('[App] ⏮ RESUME called | returnSlide:', returnTo !== null ? returnTo + 1 : 'NULL', '| currentSlide before:', currentSlideRef.current + 1);
 
       clearAdvanceTimeout();
       returnSlideRef.current = null;
@@ -112,11 +126,16 @@ function App() {
       lastSpokenSlideRef.current = -1; // Force re-narration so AI explains the return slide
 
       if (returnTo !== null) {
+        console.log('[App] ⏮ Setting currentSlide to', returnTo + 1);
         updateContext(slidesRef.current, returnTo);
         updateInstructions(slidesRef.current, returnTo);
         flushSync(() => setCurrentSlide(returnTo));
+      } else {
+        console.log('[App] ⏮ WARNING: returnSlide was NULL! Staying on currentSlide', currentSlideRef.current + 1);
       }
     },
+
+    getReturnSlideIndex: () => returnSlideRef.current,
   });
 
   // --- Update context when slide changes ---
@@ -164,12 +183,21 @@ function App() {
       if (e.code === 'Space' && !e.repeat) {
         e.preventDefault();
         if (isSpeaking) {
-          if (isAutoAdvancingRef.current) {
+          // IMPORTANT: set isAutoAdvancing=false BEFORE interrupt(), because
+          // interrupt() → tts.stop() → onSpeakingChange(false) which checks isAutoAdvancing.
+          // If we don't clear it first, onSpeakingChange overwrites returnSlideRef
+          // with the current (auto-advanced) slide instead of keeping the saved one.
+          const wasAutoAdvancing = isAutoAdvancingRef.current;
+          isAutoAdvancingRef.current = false;
+          clearAdvanceTimeout();
+
+          // returnSlideRef was already saved when the last narration completed.
+          // Only set it if null (e.g., interrupting the very first slide mid-narration).
+          if (wasAutoAdvancing && returnSlideRef.current === null) {
             returnSlideRef.current = currentSlideRef.current;
           }
+          console.log('[App] Space pressed — returnSlide:', returnSlideRef.current !== null ? returnSlideRef.current + 1 : 'null');
           interrupt();
-          clearAdvanceTimeout();
-          isAutoAdvancingRef.current = false;
         }
         return;
       }
